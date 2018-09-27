@@ -6,8 +6,7 @@ The script generates user data in the .csv file.
 ### Requirements:
 1. Python 3.5 and higher.
 2. Mimesis library should be installed <https://mimesis.readthedocs.io/>.
-
-    pip install mimesis
+`pip install mimesis`
 
 ### Variables:
 1. **file name** - file name. By default - users_data.csv
