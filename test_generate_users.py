@@ -11,6 +11,111 @@ from unittest.mock import patch
 
 
 class GenerateUsersTest(unittest.TestCase):
+    def test_import_has_no_side_effects(self):
+        script = Path(__file__).with_name("generate_users.py")
+        with patch("builtins.input", side_effect=AssertionError("Unexpected input")), \
+                patch("builtins.open", side_effect=AssertionError("Unexpected output")):
+            namespace = runpy.run_path(str(script), run_name="import_check")
+        self.assertTrue(callable(namespace["main"]))
+
+    def test_incomplete_input(self):
+        script = Path(__file__).with_name("generate_users.py")
+        for answers in ("", "users.csv\n", "users.csv\nen\n"):
+            with self.subTest(answers=answers), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(
+                    [sys.executable, "-B", str(script)], input=answers,
+                    text=True, capture_output=True, cwd=directory, timeout=30,
+                )
+                self.assert_input_error(result, "input ended")
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_interrupted_input(self):
+        script = Path(__file__).with_name("generate_users.py")
+        stderr = io.StringIO()
+        with patch("builtins.input", side_effect=KeyboardInterrupt), \
+                patch("builtins.open", side_effect=AssertionError("Unexpected output")), \
+                redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                try:
+                    runpy.run_path(str(script), run_name="__main__")
+                except KeyboardInterrupt:
+                    self.fail("KeyboardInterrupt escaped the CLI")
+        self.assertEqual(raised.exception.code, 130)
+        self.assertIn("Interrupted by user", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_output_errors_after_first_record(self):
+        script = Path(__file__).with_name("generate_users.py")
+        failures = [
+            ("write", OSError("Disk full"), 1),
+            ("close", OSError("Flush failed"), 1),
+            ("write", UnicodeEncodeError("ascii", "я", 0, 1, "not ASCII"), 1),
+            ("write", csv.Error("Invalid CSV data"), 1),
+            ("write", KeyboardInterrupt(), 130),
+        ]
+        real_open = open
+        for stage, error, code in failures:
+            with self.subTest(stage=stage, error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "users.csv"
+                output.write_bytes(b"sentinel;keep\n")
+                writes = []
+
+                class FaultyFile:
+                    def __init__(self, file):
+                        self.file = file
+
+                    def __enter__(self):
+                        return self
+
+                    def write(self, data):
+                        if stage == "write" and writes:
+                            raise error
+                        result = self.file.write(data)
+                        writes.append(data)
+                        return result
+
+                    def __exit__(self, *args):
+                        self.file.close()
+                        if stage == "close":
+                            raise error
+
+                def faulty_open(*args, **kwargs):
+                    return FaultyFile(real_open(*args, **kwargs))
+
+                stderr = io.StringIO()
+                with patch("builtins.input", side_effect=[str(output), "en", "2"]), \
+                        patch("builtins.open", side_effect=faulty_open), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        try:
+                            runpy.run_path(str(script), run_name="__main__")
+                        except KeyboardInterrupt:
+                            self.fail("KeyboardInterrupt escaped the CLI")
+                self.assertEqual(raised.exception.code, code)
+                self.assertIn("incomplete", stderr.getvalue().lower())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                self.assertTrue(output.read_bytes().startswith(b"sentinel;keep\n"))
+                with output.open(newline="") as file:
+                    self.assertEqual(len(list(csv.reader(file, delimiter=";"))), 2)
+
+    def test_internal_generation_errors_keep_traceback(self):
+        script = Path(__file__).with_name("generate_users.py")
+        for error_name in ("AttributeError", "TypeError", "OSError", "ValueError"):
+            with self.subTest(error=error_name), tempfile.TemporaryDirectory() as directory:
+                driver = (
+                    "import runpy\nfrom unittest.mock import Mock, patch\n"
+                    "user = Mock()\n"
+                    f"user.person.identifier.side_effect = {error_name}('internal failure')\n"
+                    "with patch('mimesis.Generic', return_value=user):\n"
+                    f"    runpy.run_path({str(script)!r}, run_name='__main__')\n"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", driver], input="users.csv\nen\n1\n",
+                    text=True, capture_output=True, cwd=directory, timeout=30,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Traceback", result.stderr)
+                self.assertIn(f"{error_name}: internal failure", result.stderr)
+
     def run_script(self, directory, path="users.csv", locale="en", count="1"):
         script = Path(__file__).with_name("generate_users.py")
         return subprocess.run(
