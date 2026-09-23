@@ -42,8 +42,16 @@ def user_info(user):
     return data
 
 
+def partial_output_message(completed_records, last_record_may_be_incomplete=True):
+    message = f"Completed records in this run: {completed_records}. Output may be incomplete."
+    if last_record_may_be_incomplete:
+        message += " The last attempted record may be incomplete."
+    return message + " Check the file before retrying."
+
+
 def main():
     output_started = False
+    completed_records = 0
     try:
         try:
             path = input('Enter the csv filename (default: users_data.csv):  ') or "users_data.csv"
@@ -85,22 +93,29 @@ def main():
             try:
                 file = open(path, "a", newline='')
             except OSError as error:
-                fail(f"cannot open CSV path {path!r} for appending: {error}")
+                message = f"cannot open CSV path {path!r} for appending: {error}."
+                if output_started:
+                    message += " " + partial_output_message(completed_records, False)
+                else:
+                    message += f" Completed records in this run: {completed_records}."
+                fail(message)
             output_started = True
             try:
                 with file:
                     writer = csv.writer(file, delimiter=';')
                     writer.writerow(user_data)
             except OSError as error:
-                fail(f"cannot write CSV {path!r}: {error}. Output may be incomplete.")
+                fail(f"cannot write CSV {path!r}: {error}. " + partial_output_message(completed_records))
             except UnicodeEncodeError as error:
-                fail(f"cannot encode CSV data for {path!r}: {error}. Output may be incomplete.")
+                fail(f"cannot encode CSV data for {path!r}: {error}. " + partial_output_message(completed_records))
             except csv.Error as error:
-                fail(f"cannot serialize CSV data for {path!r}: {error}. Output may be incomplete.")
+                fail(f"cannot serialize CSV data for {path!r}: {error}. " + partial_output_message(completed_records))
+            # Count successful writes and closes, not physical disk persistence.
+            completed_records += 1
     except KeyboardInterrupt:
         message = "Interrupted by user."
         if output_started:
-            message += " Output may be incomplete."
+            message += " " + partial_output_message(completed_records)
         print(message, file=sys.stderr)
         sys.exit(130)
 
