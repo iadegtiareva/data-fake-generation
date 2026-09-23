@@ -91,11 +91,76 @@ class GenerateUsersTest(unittest.TestCase):
                         except KeyboardInterrupt:
                             self.fail("KeyboardInterrupt escaped the CLI")
                 self.assertEqual(raised.exception.code, code)
+                completed = 0 if stage == "close" else 1
+                self.assertIn(f"Completed records in this run: {completed}.", stderr.getvalue())
+                self.assertIn("Check the file before retrying", stderr.getvalue())
                 self.assertIn("incomplete", stderr.getvalue().lower())
                 self.assertNotIn("Traceback", stderr.getvalue())
                 self.assertTrue(output.read_bytes().startswith(b"sentinel;keep\n"))
                 with output.open(newline="") as file:
                     self.assertEqual(len(list(csv.reader(file, delimiter=";"))), 2)
+
+    def test_partial_failure_reports_only_completed_records(self):
+        script = Path(__file__).with_name("generate_users.py")
+        real_open = open
+        for stage in ("open", "write", "partial_write", "close", "interrupt"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "users.csv"
+                original = b"sentinel;keep\n"
+                output.write_bytes(original)
+                successful_records = []
+                opens = 0
+
+                class FaultyFile:
+                    def __init__(self, file, index):
+                        self.file = file
+                        self.index = index
+
+                    def __enter__(self):
+                        return self
+
+                    def write(self, data):
+                        if self.index == 3 and stage in ("write", "partial_write", "interrupt"):
+                            if stage == "partial_write":
+                                self.file.write("incomplete;fragment")
+                            if stage == "interrupt":
+                                raise KeyboardInterrupt()
+                            raise OSError("Disk full")
+                        result = self.file.write(data)
+                        if self.index < 3:
+                            successful_records.append(data)
+                        return result
+
+                    def __exit__(self, *args):
+                        self.file.close()
+                        if self.index == 3 and stage == "close":
+                            raise OSError("Close failed")
+
+                def faulty_open(*args, **kwargs):
+                    nonlocal opens
+                    index = opens
+                    opens += 1
+                    if index == 3 and stage == "open":
+                        raise PermissionError("Cannot reopen")
+                    return FaultyFile(real_open(*args, **kwargs), index)
+
+                stderr = io.StringIO()
+                with patch("builtins.input", side_effect=[str(output), "en", "5"]), \
+                        patch("builtins.open", side_effect=faulty_open), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        runpy.run_path(str(script), run_name="__main__")
+                self.assertEqual(raised.exception.code, 130 if stage == "interrupt" else 1)
+                content = output.read_bytes()
+                self.assertTrue(content.startswith(original))
+                with output.open(newline="") as file:
+                    text = file.read()
+                self.assertTrue(text.startswith("sentinel;keep\n" + "".join(successful_records)))
+                if stage == "partial_write":
+                    self.assertTrue(content.endswith(b"incomplete;fragment"))
+                self.assertIn("Completed records in this run: 3.", stderr.getvalue())
+                self.assertIn("incomplete", stderr.getvalue().lower())
+                self.assertIn("Check the file before retrying", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_internal_generation_errors_keep_traceback(self):
         script = Path(__file__).with_name("generate_users.py")
